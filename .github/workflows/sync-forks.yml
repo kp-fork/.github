@@ -1,0 +1,80 @@
+name: Sync fork repositories
+
+on:
+  schedule:
+    # Runs daily at 03:30 KST.
+    - cron: "30 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GH_MAINT_TOKEN }}
+      TARGET_OWNER: kp-fork
+    steps:
+      - name: Check token
+        run: |
+          set -euo pipefail
+          gh auth status -h github.com
+
+      - name: Sync updated forks with upstream
+        run: |
+          set -euo pipefail
+
+          api_json() {
+            gh api "$1"
+          }
+
+          sync_ref() {
+            repo="$1"
+            meta="$(api_json "repos/$repo")"
+            parent="$(jq -r '.parent.full_name // empty' <<<"$meta")"
+            branch="$(jq -r '.parent.default_branch // .default_branch' <<<"$meta")"
+
+            if [ -z "$parent" ] || [ -z "$branch" ]; then
+              echo "skip $repo: missing parent or branch"
+              return 0
+            fi
+
+            src_sha="$(api_json "repos/$parent/git/ref/heads/$branch" | jq -r '.object.sha')"
+            dst_sha="$(api_json "repos/$repo/git/ref/heads/$branch" | jq -r '.object.sha // empty' || true)"
+
+            if [ "$src_sha" = "$dst_sha" ]; then
+              echo "$repo is current at $branch"
+              return 0
+            fi
+
+            echo "syncing $repo from $parent branch $branch"
+            gh repo sync "$repo" --branch "$branch" --force || true
+
+            dst_sha="$(api_json "repos/$repo/git/ref/heads/$branch" | jq -r '.object.sha // empty' || true)"
+            if [ "$src_sha" = "$dst_sha" ]; then
+              echo "$repo synced at $branch"
+              return 0
+            fi
+
+            if [ -z "$dst_sha" ]; then
+              echo "creating $repo branch $branch at $src_sha"
+              gh api \
+                --method POST \
+                "repos/$repo/git/refs" \
+                -f ref="refs/heads/$branch" \
+                -f sha="$src_sha"
+            else
+              echo "forcing $repo branch $branch to $src_sha"
+              gh api \
+                --method PATCH \
+                "repos/$repo/git/refs/heads/$branch" \
+                -f sha="$src_sha" \
+                -F force=true
+            fi
+          }
+
+          gh repo list "$TARGET_OWNER" --fork --limit 1000 --json nameWithOwner --jq '.[].nameWithOwner' |
+            while IFS= read -r repo; do
+              sync_ref "$repo"
+            done
