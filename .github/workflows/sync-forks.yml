@@ -3,7 +3,7 @@ name: Sync fork repositories
 on:
   schedule:
     # Runs daily at 00:00 KST.
-    - cron: "0 15 * * *"
+    - cron: "0 15 * * WED"
   workflow_dispatch:
 
 permissions:
