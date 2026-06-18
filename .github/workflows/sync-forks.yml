@@ -3,7 +3,7 @@ name: Sync fork repositories
 on:
   schedule:
     # Runs daily at 00:00 KST.
-    - cron: "0 15 * * WED"
+    - cron: "0 15 * * *"
   workflow_dispatch:
 
 permissions:
@@ -25,25 +25,58 @@ jobs:
         run: |
           set -euo pipefail
 
-          api_json() {
-            gh api "$1"
+          total_count=0
+          current_count=0
+          synced_count=0
+          created_count=0
+          forced_count=0
+          skipped_count=0
+          failed_count=0
+          updated_details="$(mktemp)"
+          skipped_details="$(mktemp)"
+          failed_details="$(mktemp)"
+
+          record_skip() {
+            repo="$1"
+            reason="$2"
+            skipped_count=$((skipped_count + 1))
+            echo "skip $repo: $reason"
+            printf -- '- `%s`: %s\n' "$repo" "$reason" >> "$skipped_details"
+          }
+
+          record_failure() {
+            repo="$1"
+            reason="$2"
+            failed_count=$((failed_count + 1))
+            echo "failed $repo: $reason"
+            printf -- '- `%s`: %s\n' "$repo" "$reason" >> "$failed_details"
           }
 
           sync_ref() {
             repo="$1"
-            meta="$(api_json "repos/$repo")"
+            if ! meta="$(gh api "repos/$repo" 2>&1)"; then
+              record_skip "$repo" "cannot fetch fork metadata"
+              return 0
+            fi
+
             parent="$(jq -r '.parent.full_name // empty' <<<"$meta")"
             branch="$(jq -r '.parent.default_branch // .default_branch' <<<"$meta")"
 
             if [ -z "$parent" ] || [ -z "$branch" ]; then
-              echo "skip $repo: missing parent or branch"
+              record_skip "$repo" "missing parent or branch"
               return 0
             fi
 
-            src_sha="$(api_json "repos/$parent/git/ref/heads/$branch" | jq -r '.object.sha')"
-            dst_sha="$(api_json "repos/$repo/git/ref/heads/$branch" | jq -r '.object.sha // empty' || true)"
+            if ! src_ref="$(gh api "repos/$parent/git/ref/heads/$branch" 2>&1)"; then
+              record_skip "$repo" "cannot fetch upstream ref $parent:$branch"
+              return 0
+            fi
+
+            src_sha="$(jq -r '.object.sha' <<<"$src_ref")"
+            dst_sha="$(gh api "repos/$repo/git/ref/heads/$branch" --jq '.object.sha // empty' 2>/dev/null || true)"
 
             if [ "$src_sha" = "$dst_sha" ]; then
+              current_count=$((current_count + 1))
               echo "$repo is current at $branch"
               return 0
             fi
@@ -51,30 +84,79 @@ jobs:
             echo "syncing $repo from $parent branch $branch"
             gh repo sync "$repo" --branch "$branch" --force || true
 
-            dst_sha="$(api_json "repos/$repo/git/ref/heads/$branch" | jq -r '.object.sha // empty' || true)"
+            dst_sha="$(gh api "repos/$repo/git/ref/heads/$branch" --jq '.object.sha // empty' 2>/dev/null || true)"
             if [ "$src_sha" = "$dst_sha" ]; then
+              synced_count=$((synced_count + 1))
               echo "$repo synced at $branch"
+              printf -- '- `%s`: synced `%s` from `%s`\n' "$repo" "$branch" "$parent" >> "$updated_details"
               return 0
             fi
 
             if [ -z "$dst_sha" ]; then
               echo "creating $repo branch $branch at $src_sha"
-              gh api \
+              if gh api \
                 --method POST \
                 "repos/$repo/git/refs" \
                 -f ref="refs/heads/$branch" \
-                -f sha="$src_sha"
+                -f sha="$src_sha"; then
+                created_count=$((created_count + 1))
+                printf -- '- `%s`: created `%s` from `%s`\n' "$repo" "$branch" "$parent" >> "$updated_details"
+              else
+                record_failure "$repo" "failed to create $branch at $src_sha"
+              fi
             else
               echo "forcing $repo branch $branch to $src_sha"
-              gh api \
+              if gh api \
                 --method PATCH \
                 "repos/$repo/git/refs/heads/$branch" \
                 -f sha="$src_sha" \
-                -F force=true
+                -F force=true; then
+                forced_count=$((forced_count + 1))
+                printf -- '- `%s`: forced `%s` from `%s`\n' "$repo" "$branch" "$parent" >> "$updated_details"
+              else
+                record_failure "$repo" "failed to force $branch to $src_sha"
+              fi
             fi
           }
 
-          gh repo list "$TARGET_OWNER" --fork --limit 1000 --json nameWithOwner --jq '.[].nameWithOwner' |
-            while IFS= read -r repo; do
-              sync_ref "$repo"
-            done
+          while IFS= read -r repo; do
+            total_count=$((total_count + 1))
+            sync_ref "$repo"
+          done < <(gh repo list "$TARGET_OWNER" --fork --limit 1000 --json nameWithOwner --jq '.[].nameWithOwner')
+
+          {
+            echo "## Fork upstream sync summary"
+            echo
+            echo "| Metric | Count |"
+            echo "| --- | ---: |"
+            echo "| Forks scanned | $total_count |"
+            echo "| Already current | $current_count |"
+            echo "| Synced by gh repo sync | $synced_count |"
+            echo "| Branches created manually | $created_count |"
+            echo "| Branches forced manually | $forced_count |"
+            echo "| Skipped | $skipped_count |"
+            echo "| Failed | $failed_count |"
+            echo
+
+            if [ -s "$updated_details" ]; then
+              echo "### Updated"
+              cat "$updated_details"
+              echo
+            fi
+
+            if [ -s "$skipped_details" ]; then
+              echo "### Skipped"
+              cat "$skipped_details"
+              echo
+            fi
+
+            if [ -s "$failed_details" ]; then
+              echo "### Failed"
+              cat "$failed_details"
+              echo
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$failed_count" -gt 0 ]; then
+            exit 1
+          fi
